@@ -1,0 +1,11 @@
+build/
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+.vs/
+*.user
+*.suo
