@@ -1,68 +1,71 @@
 #ifndef SLAM_EKF_SLAM_H
 #define SLAM_EKF_SLAM_H
 
-#include <opencv2/opencv.hpp>
+#include "slam/types.h"
 #include <vector>
 #include <deque>
-#include "slam/se3.h"
 
 namespace slam {
 
 struct EKFState {
-    cv::Mat T_cw;  // 4x4, camera pose in world frame
-    cv::Mat T_mc;  // 4x4, character-to-camera extrinsic
-    cv::Mat P;     // 12x12, error-state covariance
+    SE3 T_cw;        // camera pose in world frame
+    SE3 T_mc;        // character-to-camera extrinsic (M -> C)
+    Matrix12 P;      // error-state covariance
 
-    EKFState() : T_cw(cv::Mat::eye(4, 4, CV_64F)),
-                 T_mc(cv::Mat::eye(4, 4, CV_64F)),
-                 P(cv::Mat::eye(12, 12, CV_64F)) {}
+    EKFState() : T_cw(), T_mc(), P(Matrix12::Identity()) {}
 };
 
-struct DelayedObs {
-    int frame_idx;       // which frame this observation corresponds to
-    cv::Mat obs;         // 3x1: [x_w, z_w, theta_w]
-    cv::Mat R;           // 3x3 observation noise covariance
-};
-
+// Error-state EKF fusing visual odometry (VO) with minimap observations.
+// State: T_cw (camera pose), T_mc (extrinsic), 12-D error state (right perturbation).
 class EKFSLAM {
 public:
     EKFSLAM();
 
-    // Initialize with camera pose and extrinsic
-    void init(const cv::Mat& T_cw_init, const cv::Mat& T_mc_init,
-              const cv::Mat& P_init = cv::Mat::eye(12, 12, CV_64F) * 1e-3);
+    void init(const SE3& T_cw_init, const SE3& T_mc_init,
+              const Matrix12& P_init = Matrix12::Zero());
 
-    // Prediction step: VO-driven
-    // delta_T: 4x4, relative motion from VO
-    // Q: 12x12 process noise covariance
-    void predict(const cv::Mat& delta_T, const cv::Mat& Q);
+    // VO-driven prediction: T_cw <- T_cw * delta_T, T_mc unchanged.
+    void predict(const SE3& delta_T, const Matrix12& Q);
 
-    // Update step: minimap observation
-    // obs: 3x1 [x_w, z_w, theta_w]
-    // R: 3x3 observation noise covariance
-    void update(const cv::Mat& obs, const cv::Mat& R);
+    // Minimap absolute observation update: obs = [x_w, z_w, theta_w].
+    void update(const MapObs& obs, const Matrix3& R);
 
-    // Update with delayed observation (repropagate after)
-    void updateDelayed(const DelayedObs& d_obs,
-                       const std::vector<cv::Mat>& delta_T_history);
+    // Minimap frame-to-frame odometry update.
+    // delta_world: measured world-frame character displacement (dx, dz, dyaw)
+    // between the previous and current camera frames.
+    void updateMinimapOdom(const Eigen::Vector3d& delta_world, const Matrix3& R);
+
+    // Reset the "previous frame" reference (e.g. after an occlusion gap).
+    void resetOdomRef() { prev_pose_set_ = false; }
 
     // --- Getters ---
-    cv::Mat getCameraPose() const { return state_.T_cw; }
-    cv::Mat getExtrinsic() const  { return state_.T_mc; }
-    cv::Mat getCovariance() const { return state_.P; }
-    cv::Mat getCharacterPose() const { return se3_compose(state_.T_cw, state_.T_mc); }
+    SE3 getCameraPose() const { return state_.T_cw; }
+    SE3 getExtrinsic() const  { return state_.T_mc; }
+    Matrix12 getCovariance() const { return state_.P; }
+    SE3 getCharacterPose() const { return state_.T_cw * state_.T_mc; }
 
 private:
     EKFState state_;
+    double prev_x_ = 0.0, prev_z_ = 0.0, prev_yaw_ = 0.0;  // previous char pose
+    bool prev_pose_set_ = false;
 
-    // Observation function: T_mw -> [x, z, theta]^T
-    cv::Mat observe(const cv::Mat& T_mw) const;
+    // Extract [x_w, z_w, theta_w] from T_mw (Y-UP, forward = +Z local axis).
+    MapObs observe(const SE3& T_mw) const;
 
-    // Numerical Jacobian of observation w.r.t. error state
-    cv::Mat computeObsJacobian(const cv::Mat& T_cw, const cv::Mat& T_mc) const;
+    // Predicted world-frame character displacement (dx, dz, dyaw) between the
+    // stored previous pose and the current character pose.
+    Eigen::Vector3d odomPrediction(const SE3& T_cw, const SE3& T_mc) const;
 
-    // Inject error state into nominal state
-    void injectErrorState(const cv::Mat& dxi);
+    // Numerical Jacobian of observe w.r.t. 12-D error state (right perturbation).
+    Eigen::Matrix<double, 3, 12> computeObsJacobian(const SE3& T_cw,
+                                                     const SE3& T_mc) const;
+
+    // Numerical Jacobian of the world-frame odometry residual w.r.t. 12-D error
+    // state (right perturbation of current T_cw and T_mc; prev pose fixed).
+    Eigen::Matrix<double, 3, 12> computeOdomJacobian(const SE3& T_cw,
+                                                      const SE3& T_mc) const;
+
+    static double wrapAngle(double a);
 };
 
 } // namespace slam

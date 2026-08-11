@@ -1,132 +1,183 @@
 #include "slam/ekf_slam.h"
-#include "slam/se3.h"
-#include "slam/types.h"
 #include <cmath>
 
 namespace slam {
 
 EKFSLAM::EKFSLAM() {}
 
-void EKFSLAM::init(const cv::Mat& T_cw_init, const cv::Mat& T_mc_init,
-                   const cv::Mat& P_init) {
-    state_.T_cw = T_cw_init.clone();
-    state_.T_mc = T_mc_init.clone();
-    state_.P = P_init.clone();
+void EKFSLAM::init(const SE3& T_cw_init, const SE3& T_mc_init,
+                   const Matrix12& P_init) {
+    state_.T_cw = T_cw_init;
+    state_.T_mc = T_mc_init;
+    state_.P = P_init;
+    prev_pose_set_ = false;
 }
 
-void EKFSLAM::predict(const cv::Mat& delta_T, const cv::Mat& Q) {
-    // --- Nominal state propagation ---
-    state_.T_cw = se3_compose(state_.T_cw, delta_T);
-    // T_mc unchanged (random walk)
-
-    // --- Error-state covariance propagation ---
-    // F_k = [Ad(delta_T^{-1}), 0; 0, I_6]
-    cv::Mat delta_T_inv = se3_inv(delta_T);
-    cv::Mat Ad_dTinv = se3_adj(delta_T_inv);
-
-    cv::Mat F = cv::Mat::eye(12, 12, CV_64F);
-    Ad_dTinv.copyTo(F(cv::Rect(0, 0, 6, 6)));
-
-    state_.P = F * state_.P * F.t() + Q;
+double EKFSLAM::wrapAngle(double a) {
+    while (a > M_PI) a -= 2.0 * M_PI;
+    while (a < -M_PI) a += 2.0 * M_PI;
+    return a;
 }
 
-cv::Mat EKFSLAM::observe(const cv::Mat& T_mw) const {
-    // Extract [x_w, z_w, theta_w] from T_mw
-    cv::Mat t = trans(T_mw);  // 3x1
-    cv::Mat R = rot(T_mw);    // 3x3
-
-    // Y-UP: yaw = atan2(forward_x, forward_z)
-    // forward vector in world frame: R * [0, 0, 1]^T = [R02, R12, R22]^T
-    double f_x = R.at<double>(0, 2);
-    double f_z = R.at<double>(2, 2);
-    double theta = std::atan2(f_x, f_z);
-
-    cv::Mat obs(3, 1, CV_64F);
-    obs.at<double>(0) = t.at<double>(0);
-    obs.at<double>(1) = t.at<double>(2);
-    obs.at<double>(2) = theta;
+MapObs EKFSLAM::observe(const SE3& T_mw) const {
+    const Eigen::Vector3d t = T_mw.translation();
+    const Eigen::Matrix3d R = T_mw.rotationMatrix();
+    // forward vector (local +Z) projected to world: R * e_z
+    const double fx = R(0, 2);
+    const double fz = R(2, 2);
+    MapObs obs;
+    obs << t(0), t(2), std::atan2(fx, fz);
     return obs;
 }
 
-cv::Mat EKFSLAM::computeObsJacobian(const cv::Mat& T_cw, const cv::Mat& T_mc) const {
-    // Numerical Jacobian: perturb each of the 12 error-state dimensions
-    cv::Mat H = cv::Mat::zeros(3, 12, CV_64F);
-    double eps = 1e-6;
+Eigen::Matrix<double, 3, 12>
+EKFSLAM::computeObsJacobian(const SE3& T_cw, const SE3& T_mc) const {
+    const double eps = 1e-6;
+    Eigen::Matrix<double, 3, 12> H;
+    H.setZero();
 
-    cv::Mat T_mw = se3_compose(T_cw, T_mc);
-    cv::Mat obs0 = observe(T_mw);
+    const MapObs r0 = observe(T_cw * T_mc);
 
-    // Perturb T_cw (first 6 dimensions)
     for (int i = 0; i < 6; ++i) {
-        cv::Mat dxi = cv::Mat::zeros(6, 1, CV_64F);
-        dxi.at<double>(i) = eps;
-        cv::Mat T_cw_pert = se3_compose(T_cw, se3_exp(dxi));
-        cv::Mat T_mw_pert = se3_compose(T_cw_pert, T_mc);
-        cv::Mat obs_pert = observe(T_mw_pert);
-        cv::Mat diff = (obs_pert - obs0) / eps;
-        diff.copyTo(H(cv::Rect(i, 0, 1, 3)));
+        Vector6 dxi = Vector6::Zero();
+        dxi(i) = eps;
+        const MapObs rp = observe(T_cw * SE3::exp(dxi) * T_mc);
+        H.block<3, 1>(0, i) = (rp - r0) / eps;
     }
-
-    // Perturb T_mc (last 6 dimensions)
     for (int i = 0; i < 6; ++i) {
-        cv::Mat dxi = cv::Mat::zeros(6, 1, CV_64F);
-        dxi.at<double>(i) = eps;
-        cv::Mat T_mc_pert = se3_compose(T_mc, se3_exp(dxi));
-        cv::Mat T_mw_pert = se3_compose(T_cw, T_mc_pert);
-        cv::Mat obs_pert = observe(T_mw_pert);
-        cv::Mat diff = (obs_pert - obs0) / eps;
-        diff.copyTo(H(cv::Rect(6 + i, 0, 1, 3)));
+        Vector6 dxi = Vector6::Zero();
+        dxi(i) = eps;
+        const MapObs rp = observe(T_cw * T_mc * SE3::exp(dxi));
+        H.block<3, 1>(0, 6 + i) = (rp - r0) / eps;
     }
-
     return H;
 }
 
-void EKFSLAM::update(const cv::Mat& obs, const cv::Mat& R) {
-    // --- Compute residual ---
-    cv::Mat T_mw = se3_compose(state_.T_cw, state_.T_mc);
-    cv::Mat obs_pred = observe(T_mw);
-    cv::Mat r = obs - obs_pred;  // 3x1
+void EKFSLAM::predict(const SE3& delta_T, const Matrix12& Q) {
+    // Save the current character pose as the reference for the next SE(2) odom
+    // BEFORE propagation (i.e. this is the pose at the "previous" timestamp).
+    if (!prev_pose_set_) {
+        prev_x_ = (state_.T_cw * state_.T_mc).translation()(0);
+        prev_z_ = (state_.T_cw * state_.T_mc).translation()(2);
+        prev_yaw_ = std::atan2((state_.T_cw * state_.T_mc).rotationMatrix()(0, 2),
+                               (state_.T_cw * state_.T_mc).rotationMatrix()(2, 2));
+        prev_pose_set_ = true;
+    }
+    // Nominal propagation
+    state_.T_cw = state_.T_cw * delta_T;
+    // T_mc unchanged (random walk zero-mean)
 
-    // Normalize theta to [-pi, pi]
-    while (r.at<double>(2) > M_PI)  r.at<double>(2) -= 2.0 * M_PI;
-    while (r.at<double>(2) < -M_PI) r.at<double>(2) += 2.0 * M_PI;
+    // Error-state transition F = [Ad(delta_T^{-1}), 0; 0, I6]
+    const Matrix6 ad = delta_T.inverse().Adj();
+    Matrix12 F = Matrix12::Identity();
+    F.topLeftCorner<6, 6>() = ad;
 
-    // --- Compute Jacobian ---
-    cv::Mat H = computeObsJacobian(state_.T_cw, state_.T_mc);
-
-    // --- Kalman gain ---
-    cv::Mat S = H * state_.P * H.t() + R;
-    cv::Mat K = state_.P * H.t() * S.inv(cv::DECOMP_SVD);
-
-    // --- Error-state update ---
-    cv::Mat dxi = K * r;  // 12x1
-
-    // --- Inject error state into nominal state ---
-    injectErrorState(dxi);
-
-    // --- Covariance update ---
-    cv::Mat I = cv::Mat::eye(12, 12, CV_64F);
-    state_.P = (I - K * H) * state_.P;
+    state_.P = F * state_.P * F.transpose() + Q;
 }
 
-void EKFSLAM::injectErrorState(const cv::Mat& dxi) {
-    cv::Mat dxi_cw = dxi(cv::Rect(0, 0, 1, 6));
-    cv::Mat dxi_mc = dxi(cv::Rect(0, 6, 1, 6));
-
-    cv::Mat dT_cw = se3_exp(dxi_cw);
-    cv::Mat dT_mc = se3_exp(dxi_mc);
-
-    state_.T_cw = se3_compose(state_.T_cw, dT_cw);
-    state_.T_mc = se3_compose(state_.T_mc, dT_mc);
+// World-frame character displacement (dx, dz, dyaw) between the previous
+// reference pose and the current character pose T_cw * T_mc.
+Eigen::Vector3d EKFSLAM::odomPrediction(const SE3& T_cw, const SE3& T_mc) const {
+    const SE3 T_mw = T_cw * T_mc;
+    const Eigen::Vector3d t = T_mw.translation();
+    const Eigen::Matrix3d R = T_mw.rotationMatrix();
+    const double yaw = std::atan2(R(0, 2), R(2, 2));
+    Eigen::Vector3d d;
+    d << t(0) - prev_x_, t(2) - prev_z_, wrapAngle(yaw - prev_yaw_);
+    return d;
 }
 
-void EKFSLAM::updateDelayed(const DelayedObs& d_obs,
-                             const std::vector<cv::Mat>& delta_T_history) {
-    // For now, simple implementation: store a history of states and
-    // rewind, update, then repropagate.
-    // In a full implementation, this would use a state buffer.
-    // Simplified: just use the current state (assumes small delay)
-    update(d_obs.obs, d_obs.R);
+Eigen::Matrix<double, 3, 12>
+EKFSLAM::computeOdomJacobian(const SE3& T_cw, const SE3& T_mc) const {
+    const double eps = 1e-6;
+    Eigen::Matrix<double, 3, 12> H;
+    H.setZero();
+
+    const Eigen::Vector3d r0 = odomPrediction(T_cw, T_mc);
+
+    for (int i = 0; i < 6; ++i) {
+        Vector6 dxi = Vector6::Zero();
+        dxi(i) = eps;
+        const Eigen::Vector3d rp = odomPrediction(T_cw * SE3::exp(dxi), T_mc);
+        H.block<3, 1>(0, i) = (rp - r0) / eps;
+    }
+    for (int i = 0; i < 6; ++i) {
+        Vector6 dxi = Vector6::Zero();
+        dxi(i) = eps;
+        const Eigen::Vector3d rp = odomPrediction(T_cw, T_mc * SE3::exp(dxi));
+        H.block<3, 1>(0, 6 + i) = (rp - r0) / eps;
+    }
+    return H;
+}
+
+void EKFSLAM::updateMinimapOdom(const Eigen::Vector3d& delta_world,
+                                const Matrix3& R) {
+    if (!prev_pose_set_) return;
+
+    // Residual: measured minus predicted world-frame displacement.
+    Eigen::Vector3d r = delta_world - odomPrediction(state_.T_cw, state_.T_mc);
+    r(2) = wrapAngle(r(2));
+
+    const Eigen::Matrix<double, 3, 12> H =
+        computeOdomJacobian(state_.T_cw, state_.T_mc);
+
+    const Eigen::Matrix3d S = H * state_.P * H.transpose() + R;
+    const Eigen::Matrix<double, 12, 3> K =
+        state_.P * H.transpose() * S.inverse();
+
+    const Eigen::Matrix<double, 12, 1> dxi = K * r;
+
+    const Vector6 dxi_cw = dxi.head<6>();
+    const Vector6 dxi_mc = dxi.tail<6>();
+    state_.T_cw = state_.T_cw * SE3::exp(dxi_cw);
+    state_.T_mc = state_.T_mc * SE3::exp(dxi_mc);
+
+    const Eigen::Matrix<double, 12, 12> I = Eigen::Matrix<double, 12, 12>::Identity();
+    const Eigen::Matrix<double, 12, 12> IKH = I - K * H;
+    state_.P = IKH * state_.P * IKH.transpose() + K * R * K.transpose();
+
+    // Retarget the reference to the now-corrected current pose so the next
+    // odometry increment is measured against the corrected frame.
+    prev_x_ = (state_.T_cw * state_.T_mc).translation()(0);
+    prev_z_ = (state_.T_cw * state_.T_mc).translation()(2);
+    prev_yaw_ = std::atan2((state_.T_cw * state_.T_mc).rotationMatrix()(0, 2),
+                           (state_.T_cw * state_.T_mc).rotationMatrix()(2, 2));
+}
+
+void EKFSLAM::update(const MapObs& obs, const Matrix3& R) {
+    const SE3 T_mw = state_.T_cw * state_.T_mc;
+    const MapObs pred = observe(T_mw);
+
+    MapObs r = obs - pred;
+    r(2) = wrapAngle(r(2));
+
+    const Eigen::Matrix<double, 3, 12> H = computeObsJacobian(state_.T_cw, state_.T_mc);
+
+    // Kalman gain
+    const Eigen::Matrix3d S = H * state_.P * H.transpose() + R;
+    const Eigen::Matrix<double, 12, 3> K =
+        state_.P * H.transpose() * S.inverse();
+
+    // Error-state update
+    const Eigen::Matrix<double, 12, 1> dxi = K * r;
+
+    // Inject error state (right perturbation)
+    const Vector6 dxi_cw = dxi.head<6>();
+    const Vector6 dxi_mc = dxi.tail<6>();
+    state_.T_cw = state_.T_cw * SE3::exp(dxi_cw);
+    state_.T_mc = state_.T_mc * SE3::exp(dxi_mc);
+
+    // Joseph-form covariance update (keeps P symmetric / PSD)
+    const Eigen::Matrix<double, 12, 12> I = Eigen::Matrix<double, 12, 12>::Identity();
+    const Eigen::Matrix<double, 12, 12> IKH = I - K * H;
+    state_.P = IKH * state_.P * IKH.transpose() + K * R * K.transpose();
+
+    // The absolute observation also corrects the current pose; retarget the
+    // odometry reference to it so the next increment is measured consistently.
+    prev_x_ = (state_.T_cw * state_.T_mc).translation()(0);
+    prev_z_ = (state_.T_cw * state_.T_mc).translation()(2);
+    prev_yaw_ = std::atan2((state_.T_cw * state_.T_mc).rotationMatrix()(0, 2),
+                           (state_.T_cw * state_.T_mc).rotationMatrix()(2, 2));
 }
 
 } // namespace slam

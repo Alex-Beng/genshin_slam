@@ -1,10 +1,8 @@
 #include "slam/ekf_slam.h"
-#include "slam/se3.h"
 #include "slam/types.h"
 #include <iostream>
 #include <iomanip>
 #include <random>
-#include <cmath>
 #include <vector>
 
 using namespace slam;
@@ -14,281 +12,226 @@ using namespace slam;
 // ============================================================
 
 struct GroundTruth {
-    std::vector<cv::Mat> T_cw_gt;   // camera poses (world frame)
-    std::vector<cv::Mat> T_mw_gt;   // character poses (world frame)
-    cv::Mat T_mc_gt;                // true extrinsic
+    std::vector<SE3> T_cw_gt;  // camera poses
+    std::vector<SE3> T_mw_gt;  // character poses
+    SE3 T_mc_gt;               // true extrinsic
 };
 
-// Generate ground truth trajectory
+// Y-UP rotation about the Y axis by `yaw`.
+SE3 rotY(double yaw) {
+    Eigen::AngleAxisd aa(yaw, Eigen::Vector3d::UnitY());
+    return SE3(SO3(Eigen::Matrix3d(aa)), Eigen::Vector3d::Zero());
+}
+
 GroundTruth generateGroundTruth(int N, double dt, double radius, double omega) {
     GroundTruth gt;
-    // True extrinsic: camera is above and slightly in front of character
-    // Character->Camera: translate (0.2, 0.5, 0.0) in character frame
-    cv::Mat t_mc = (cv::Mat_<double>(3, 1) << 0.2, 0.5, 0.0);
-    cv::Mat R_mc = cv::Mat::eye(3, 3, CV_64F);  // identity rotation
-    gt.T_mc_gt = makeT(R_mc, t_mc);
+    gt.T_mc_gt = makeT(Matrix3::Identity(), Eigen::Vector3d(0.2, 0.5, 0.0));
 
     for (int i = 0; i < N; ++i) {
-        double t = i * dt;
-        double x = radius * std::cos(omega * t);
-        double z = radius * std::sin(omega * t);
+        const double t = i * dt;
+        const double x = radius * std::cos(omega * t);
+        const double z = radius * std::sin(omega * t);
+        const double yaw = -omega * t;  // face tangent to circle
 
-        // Character yaw: faces tangent to circle
-        // Forward direction: [-sin(ωt), 0, cos(ωt)]^T
-        double yaw = -omega * t;
-        cv::Mat R_mw;
-        double cy = std::cos(yaw);
-        double sy = std::sin(yaw);
-        // Ry(yaw) = [cy, 0, sy; 0, 1, 0; -sy, 0, cy]
-        R_mw = (cv::Mat_<double>(3, 3) <<
-                cy, 0, sy,
-                0,  1, 0,
-                -sy, 0, cy);
+        SE3 R_mw = rotY(yaw);
+        SE3 T_mw(R_mw.rotationMatrix(), Eigen::Vector3d(x, 0.0, z));
 
-        cv::Mat t_mw = (cv::Mat_<double>(3, 1) << x, 0.0, z);
-        cv::Mat T_mw = makeT(R_mw, t_mw);
-
-        // Camera pose: T_cw = T_mw * T_mc^{-1}
-        cv::Mat T_mc_inv = se3_inv(gt.T_mc_gt);
-        cv::Mat T_cw = se3_compose(T_mw, T_mc_inv);
-
+        SE3 T_cw = T_mw * gt.T_mc_gt.inverse();
         gt.T_mw_gt.push_back(T_mw);
         gt.T_cw_gt.push_back(T_cw);
     }
     return gt;
 }
 
-// Add Gaussian noise to a vector
-cv::Mat addNoise(const cv::Mat& v, double std_pos, double std_rot, std::mt19937& rng) {
+SE3 addNoiseSE3(const SE3& T, double std_pos, double std_rot, std::mt19937& rng) {
     std::normal_distribution<double> dist(0.0, 1.0);
-    cv::Mat noisy = v.clone();
-    for (int i = 0; i < 3; ++i) {
-        noisy.at<double>(i) += dist(rng) * std_pos;
-    }
-    for (int i = 3; i < 6; ++i) {
-        noisy.at<double>(i) += dist(rng) * std_rot;
-    }
-    return noisy;
+    Vector6 xi = Vector6::Zero();
+    for (int i = 0; i < 3; ++i) xi(i) = dist(rng) * std_pos;
+    for (int i = 3; i < 6; ++i) xi(i) = dist(rng) * std_rot;
+    return T * SE3::exp(xi);
 }
 
-// Add noise to SE(3) transformation
-cv::Mat addNoiseSE3(const cv::Mat& T, double std_pos, double std_rot, std::mt19937& rng) {
-    cv::Mat xi(6, 1, CV_64F);
-    std::normal_distribution<double> dist(0.0, 1.0);
-    for (int i = 0; i < 3; ++i) xi.at<double>(i) = dist(rng) * std_pos;
-    for (int i = 3; i < 6; ++i) xi.at<double>(i) = dist(rng) * std_rot;
-    return se3_compose(T, se3_exp(xi));
-}
-
-// Compute ATE between estimated and ground truth trajectory
-double computeATE(const std::vector<cv::Mat>& est, const std::vector<cv::Mat>& gt) {
+double computeATE(const std::vector<SE3>& est, const std::vector<SE3>& gt) {
     double sum = 0.0;
-    int N = std::min(est.size(), gt.size());
-    for (int i = 0; i < N; ++i) {
-        cv::Mat t_est = trans(est[i]);
-        cv::Mat t_gt  = trans(gt[i]);
-        cv::Mat diff = t_est - t_gt;
-        sum += diff.dot(diff);
+    const int n = (int)std::min(est.size(), gt.size());
+    for (int i = 0; i < n; ++i) {
+        const Eigen::Vector3d d = est[i].translation() - gt[i].translation();
+        sum += d.dot(d);
     }
-    return std::sqrt(sum / N);
+    return std::sqrt(sum / n);
 }
 
-// Compute rotation error (degrees)
-double computeRotError(const cv::Mat& R_est, const cv::Mat& R_gt) {
-    cv::Mat R_err = R_est * R_gt.t();
-    cv::Mat phi = so3_log(R_err);
-    return cv::norm(phi) * 180.0 / M_PI;
+double computeRotError(const SO3& R_est, const SO3& R_gt) {
+    const SO3 R_err = R_est * R_gt.inverse();
+    return R_err.log().norm() * 180.0 / M_PI;
 }
 
 int main() {
     std::cout << "====================================================\n";
-    std::cout << "  Genshin SLAM - EKF Mock Test\n";
+    std::cout << "  Genshin SLAM - EKF Mock Test (Sophus + Eigen)\n";
     std::cout << "====================================================\n\n";
 
-    // --- Parameters ---
     const double radius = 5.0;
     const double omega = 0.3;
     const double dt = 0.1;
-    const int N = 200;  // 20 seconds at 10 Hz
-    const int map_interval = 10;  // minimap every 1 sec
+    const int N = 200;             // 20 s @ 10 Hz
+    const int map_interval = 10;   // minimap every 1 s
 
-    // Noise levels
-    const double vo_pos_noise = 0.02;    // m
-    const double vo_rot_noise = 0.005;   // rad
-    const double map_pos_noise = 0.15;   // m
-    const double map_rot_noise = 0.05;   // rad
+    const double vo_pos_noise = 0.02;
+    const double vo_rot_noise = 0.005;
+    const double map_pos_noise = 0.15;
+    const double map_rot_noise = 0.05;
 
-    // Initial uncertainty
-    const double init_pos_unc = 0.1;     // m
-    const double init_rot_unc = 0.05;    // rad
+    const double odom_pos_noise = 0.02;   // m per 0.1s step
+    const double odom_rot_noise = 0.01;   // rad per 0.1s step
 
     std::mt19937 rng(42);
-
-    // --- Generate ground truth ---
-    std::cout << "Generating ground truth trajectory (circle, r="
-              << radius << "m, " << N << " frames)...\n";
+    std::normal_distribution<double> nd(0.0, 1.0);
+    std::cout << "Generating ground truth (circle r=" << radius << "m, "
+              << N << " frames)...\n";
     GroundTruth gt = generateGroundTruth(N, dt, radius, omega);
 
-    std::cout << "True extrinsic T_mc: t = ["
-              << gt.T_mc_gt.at<double>(0) << ", "
-              << gt.T_mc_gt.at<double>(1) << ", "
-              << gt.T_mc_gt.at<double>(2) << "]^T\n\n";
+    std::cout << "True T_mc: t = ["
+              << gt.T_mc_gt.translation().transpose() << "]^T\n\n";
 
-    // --- Initialize EKF with perturbed ground truth ---
-    std::cout << "Initializing EKF...\n";
-    slam::EKFSLAM ekf;
+    // --- Initialize EKF with perturbed state ---
+    Vector6 init_noise = Vector6::Zero();
+    for (int i = 0; i < 3; ++i) init_noise(i) = nd(rng) * 0.05;
+    for (int i = 3; i < 6; ++i) init_noise(i) = nd(rng) * 0.02;
+    SE3 T_cw_init = gt.T_cw_gt[0] * SE3::exp(init_noise);
 
-    // Perturb initial T_cw
-    cv::Mat init_noise(6, 1, CV_64F);
-    std::normal_distribution<double> dist(0.0, 1.0);
-    for (int i = 0; i < 3; ++i) init_noise.at<double>(i) = dist(rng) * 0.05;
-    for (int i = 3; i < 6; ++i) init_noise.at<double>(i) = dist(rng) * 0.02;
-    cv::Mat T_cw_init = se3_compose(gt.T_cw_gt[0], se3_exp(init_noise));
+    Vector6 mc_noise = Vector6::Zero();
+    for (int i = 0; i < 6; ++i) mc_noise(i) = nd(rng) * 0.05;
+    SE3 T_mc_init = gt.T_mc_gt * SE3::exp(mc_noise);
 
-    // Perturb initial T_mc (wrong extrinsic)
-    cv::Mat mc_noise(6, 1, CV_64F);
-    mc_noise.at<double>(0) = dist(rng) * 0.1;
-    mc_noise.at<double>(1) = dist(rng) * 0.1;
-    mc_noise.at<double>(2) = dist(rng) * 0.1;
-    mc_noise.at<double>(3) = dist(rng) * 0.05;
-    mc_noise.at<double>(4) = dist(rng) * 0.05;
-    mc_noise.at<double>(5) = dist(rng) * 0.05;
-    cv::Mat T_mc_init = se3_compose(gt.T_mc_gt, se3_exp(mc_noise));
+    Matrix12 P_init = Matrix12::Zero();
+    for (int i = 0; i < 3; ++i) P_init(i, i) = 0.1 * 0.1;
+    for (int i = 3; i < 6; ++i) P_init(i, i) = 0.05 * 0.05;
+    for (int i = 6; i < 9; ++i) P_init(i, i) = 0.1 * 0.1;
+    for (int i = 9; i < 12; ++i) P_init(i, i) = 0.05 * 0.05;
 
-    // Initial covariance
-    cv::Mat P_init = cv::Mat::zeros(12, 12, CV_64F);
-    for (int i = 0; i < 3; ++i) P_init.at<double>(i, i) = init_pos_unc * init_pos_unc;
-    for (int i = 3; i < 6; ++i) P_init.at<double>(i, i) = init_rot_unc * init_rot_unc;
-    for (int i = 6; i < 9; ++i) P_init.at<double>(i, i) = init_pos_unc * init_pos_unc;
-    for (int i = 9; i < 12; ++i) P_init.at<double>(i, i) = init_rot_unc * init_rot_unc;
-
+    EKFSLAM ekf;
     ekf.init(T_cw_init, T_mc_init, P_init);
 
-    // Process noise Q (small random walk on T_mc)
-    cv::Mat Q = cv::Mat::zeros(12, 12, CV_64F);
-    double q_pos = 1e-6;
-    double q_rot = 1e-6;
-    for (int i = 0; i < 3; ++i) Q.at<double>(i, i) = q_pos;
-    for (int i = 3; i < 6; ++i) Q.at<double>(i, i) = q_rot;
-    for (int i = 6; i < 9; ++i) Q.at<double>(i, i) = q_pos;
-    for (int i = 9; i < 12; ++i) Q.at<double>(i, i) = q_rot;
+    // Process noise: VO measurement noise enters T_cw block per step.
+    Matrix12 Q = Matrix12::Zero();
+    for (int i = 0; i < 3; ++i) Q(i, i) = vo_pos_noise * vo_pos_noise;
+    for (int i = 3; i < 6; ++i) Q(i, i) = vo_rot_noise * vo_rot_noise;
+    for (int i = 6; i < 9; ++i) Q(i, i) = 1e-6;   // T_mc pos random walk
+    for (int i = 9; i < 12; ++i) Q(i, i) = 1e-6;   // T_mc rot random walk
 
-    // Observation noise R
-    cv::Mat R_map = cv::Mat::zeros(3, 3, CV_64F);
-    R_map.at<double>(0, 0) = map_pos_noise * map_pos_noise;
-    R_map.at<double>(1, 1) = map_pos_noise * map_pos_noise;
-    R_map.at<double>(2, 2) = map_rot_noise * map_rot_noise;
+    // Observation noise
+    Matrix3 R_map = Matrix3::Zero();
+    R_map(0, 0) = map_pos_noise * map_pos_noise;
+    R_map(1, 1) = map_pos_noise * map_pos_noise;
+    R_map(2, 2) = map_rot_noise * map_rot_noise;
 
-    // --- Run EKF ---
-    std::vector<cv::Mat> estimated_poses;
-    std::vector<cv::Mat> estimated_extrinsics;
-    std::vector<double> nees_history;  // normalized estimation error squared
+    // Minimap SE(2) odometry noise
+    Matrix3 R_odom = Matrix3::Zero();
+    R_odom(0, 0) = odom_pos_noise * odom_pos_noise;
+    R_odom(1, 1) = odom_pos_noise * odom_pos_noise;
+    R_odom(2, 2) = odom_rot_noise * odom_rot_noise;
+
+    std::vector<SE3> estimated_poses;
+    estimated_poses.reserve(N);
 
     std::cout << "Running EKF simulation...\n";
-
     for (int i = 0; i < N; ++i) {
-        // --- VO measurement (with noise) ---
-        cv::Mat delta_T;
+        // VO measurement (with noise)
+        SE3 delta_T = SE3();
         if (i > 0) {
-            cv::Mat T_prev = gt.T_cw_gt[i-1];
-            cv::Mat T_curr = gt.T_cw_gt[i];
-            // True relative motion: delta = T_prev^{-1} * T_curr
-            cv::Mat delta_true = se3_compose(se3_inv(T_prev), T_curr);
-            // Add noise
+            const SE3 delta_true = gt.T_cw_gt[i - 1].inverse() * gt.T_cw_gt[i];
             delta_T = addNoiseSE3(delta_true, vo_pos_noise, vo_rot_noise, rng);
-        } else {
-            delta_T = cv::Mat::eye(4, 4, CV_64F);
         }
-
-        // --- EKF predict ---
         ekf.predict(delta_T, Q);
 
-        // --- Minimap observation (low frequency) ---
-        if (i % map_interval == 0) {
-            // Ground truth character pose
-            cv::Mat T_mw = gt.T_mw_gt[i];
-
-            // Extract observation and add noise
-            cv::Mat t = trans(T_mw);
-            cv::Mat R = rot(T_mw);
-            double f_x = R.at<double>(0, 2);
-            double f_z = R.at<double>(2, 2);
-            double theta = std::atan2(f_x, f_z);
-
-            cv::Mat obs(3, 1, CV_64F);
-            std::normal_distribution<double> nd(0.0, 1.0);
-            obs.at<double>(0) = t.at<double>(0) + nd(rng) * map_pos_noise;
-            obs.at<double>(1) = t.at<double>(2) + nd(rng) * map_pos_noise;
-            obs.at<double>(2) = theta + nd(rng) * map_rot_noise;
-
-            // --- EKF update ---
-            ekf.update(obs, R_map);
+        // Minimap frame-to-frame odometry (world-frame displacement)
+        if (i > 0) {
+            const Eigen::Vector3d dx_prev = gt.T_mw_gt[i - 1].translation();
+            const Eigen::Vector3d dx_cur = gt.T_mw_gt[i].translation();
+            const Matrix3 R_prev = gt.T_mw_gt[i - 1].rotationMatrix();
+            const Matrix3 R_cur = gt.T_mw_gt[i].rotationMatrix();
+            Eigen::Vector3d d_true;
+            d_true << dx_cur(0) - dx_prev(0),
+                      dx_cur(2) - dx_prev(2),
+                      std::atan2(R_cur(0, 2), R_cur(2, 2)) - std::atan2(R_prev(0, 2), R_prev(2, 2));
+            while (d_true(2) > M_PI) d_true(2) -= 2.0 * M_PI;
+            while (d_true(2) < -M_PI) d_true(2) += 2.0 * M_PI;
+            Eigen::Vector3d d_meas;
+            d_meas << d_true(0) + nd(rng) * odom_pos_noise,
+                      d_true(1) + nd(rng) * odom_pos_noise,
+                      d_true(2) + nd(rng) * odom_rot_noise;
+            ekf.updateMinimapOdom(d_meas, R_odom);
         }
 
-        // Store estimate
+        // Minimap observation
+        if (i % map_interval == 0) {
+            const SE3& Tmw = gt.T_mw_gt[i];
+            const Eigen::Vector3d t = Tmw.translation();
+            const Eigen::Matrix3d R = Tmw.rotationMatrix();
+            MapObs obs;
+            obs << t(0) + nd(rng) * map_pos_noise,
+                   t(2) + nd(rng) * map_pos_noise,
+                   std::atan2(R(0, 2), R(2, 2)) + nd(rng) * map_rot_noise;
+            ekf.update(obs, R_map);
+        }
         estimated_poses.push_back(ekf.getCameraPose());
-        estimated_extrinsics.push_back(ekf.getExtrinsic());
     }
 
     // --- Results ---
     std::cout << "\n====================================================\n";
     std::cout << "  Results\n";
     std::cout << "====================================================\n\n";
-
-    // Camera pose ATE
-    double ate = computeATE(estimated_poses, gt.T_cw_gt);
     std::cout << std::fixed << std::setprecision(4);
-    std::cout << "Camera ATE (position): " << ate << " m\n";
 
-    // Character pose ATE (more relevant for navigation)
-    std::vector<cv::Mat> est_char_poses;
-    for (const auto& T_cw : estimated_poses) {
-        est_char_poses.push_back(se3_compose(T_cw, ekf.getExtrinsic()));
-    }
-    double char_ate = computeATE(est_char_poses, gt.T_mw_gt);
-    std::cout << "Character ATE (position): " << char_ate << " m\n";
+    const double ate = computeATE(estimated_poses, gt.T_cw_gt);
+    std::cout << "Camera ATE (position):     " << ate << " m\n";
 
-    // Extrinsic calibration error
-    cv::Mat T_mc_est = estimated_extrinsics.back();
-    cv::Mat t_est = trans(T_mc_est);
-    cv::Mat t_gt = trans(gt.T_mc_gt);
-    cv::Mat t_err = t_est - t_gt;
-    double pos_err = cv::norm(t_err);
-    double rot_err = computeRotError(rot(T_mc_est), rot(gt.T_mc_gt));
-    std::cout << "Extrinsic translation error: " << pos_err << " m\n";
-    std::cout << "Extrinsic rotation error: " << rot_err << " deg\n";
+    std::vector<SE3> est_char_poses;
+    for (const auto& T_cw : estimated_poses)
+        est_char_poses.push_back(T_cw * ekf.getExtrinsic());
+    const double char_ate = computeATE(est_char_poses, gt.T_mw_gt);
+    std::cout << "Character ATE (position):  " << char_ate << " m\n";
 
-    std::cout << "\nEstimated extrinsic T_mc: t = ["
-              << t_est.at<double>(0) << ", "
-              << t_est.at<double>(1) << ", "
-              << t_est.at<double>(2) << "]^T\n";
-    std::cout << "True  extrinsic T_mc: t = ["
-              << t_gt.at<double>(0) << ", "
-              << t_gt.at<double>(1) << ", "
-              << t_gt.at<double>(2) << "]^T\n";
+    const SE3& T_mc_est = ekf.getExtrinsic();
+    const double ext_pos_err =
+        (T_mc_est.translation() - gt.T_mc_gt.translation()).norm();
+    const double ext_rot_err = computeRotError(T_mc_est.rotationMatrix(),
+                                               gt.T_mc_gt.rotationMatrix());
+    std::cout << "Extrinsic translation err: " << ext_pos_err << " m\n";
+    std::cout << "Extrinsic rotation err:    " << ext_rot_err << " deg\n";
+    std::cout << "Est T_mc t: [" << T_mc_est.translation().transpose() << "]^T\n";
+    std::cout << "True T_mc t: [" << gt.T_mc_gt.translation().transpose() << "]^T\n";
 
-    // Per-frame errors (first 10 and last 10)
-    std::cout << "\n--- Per-frame position errors (first 10) ---\n";
-    for (int i = 0; i < std::min(10, N); ++i) {
-        cv::Mat t_e = trans(estimated_poses[i]);
-        cv::Mat t_g = trans(gt.T_cw_gt[i]);
-        cv::Mat diff = t_e - t_g;
-        double err = cv::norm(diff);
-        std::cout << "  frame " << i << ": err = " << err << " m\n";
-    }
-
-    std::cout << "\n--- Per-frame position errors (last 10) ---\n";
-    for (int i = N - 10; i < N; ++i) {
-        cv::Mat t_e = trans(estimated_poses[i]);
-        cv::Mat t_g = trans(gt.T_cw_gt[i]);
-        cv::Mat diff = t_e - t_g;
-        double err = cv::norm(diff);
-        std::cout << "  frame " << i << ": err = " << err << " m\n";
+    std::cout << "\nPer-frame camera position errors:\n";
+    const auto print = [&](int a, int b) {
+        for (int i = a; i < b; ++i) {
+            const double e = (estimated_poses[i].translation() -
+                              gt.T_cw_gt[i].translation()).norm();
+            std::cout << "  frame " << i << ": " << e << " m\n";
+        }
+    };
+    print(0, 20);
+    for (int qi = 20; qi < N; qi += 20) {
+        const double e = (estimated_poses[qi].translation() -
+                          gt.T_cw_gt[qi].translation()).norm();
+        std::cout << "  frame " << qi << ": " << e << " m\n";
     }
 
     std::cout << "\n====================================================\n";
     std::cout << "  Test complete.\n";
     std::cout << "====================================================\n";
-
     return 0;
 }
+
+
+
+
+
+
+
+
+
+
+
+

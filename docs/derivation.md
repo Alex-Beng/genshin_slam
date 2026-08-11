@@ -342,6 +342,7 @@ $$
 |------|------|----------|------|
 | VO 帧间约束 | $T_{cw,i} - T_{cw,i+1}$ | 6 | 相对位姿测量 |
 | 小地图观测 | $T_{cw,i} - T_{mc}$ | 3 | 绝对位姿约束 |
+| 小地图帧间里程计 | $T_{cw,i-1} - T_{cw,i}$（+ $T_{mc}$） | 3 | 角色世界系相对位移 |
 | 先验因子 | $T_{cw,0}$ | 6 | 固定 Gauge 自由度 |
 
 ### 3.2 残差定义
@@ -406,10 +407,30 @@ $$
 r_{prior}(T_{cw,0}) = \log(T_{cw,0}^{-1} \cdot T_{cw,0}^{\text{init}})^\vee \in \mathbb{R}^6
 $$
 
+#### 小地图帧间里程计约束（相对位移）
+
+小地图除低频绝对观测外，还可对相邻帧做图像配准，得到角色在**世界系 XZ 平面**的帧间位移：
+
+$$
+\delta_{map,i} = \begin{bmatrix} x_i - x_{i-1} \\ z_i - z_{i-1} \\ \theta_i - \theta_{i-1} \end{bmatrix} \in \mathbb{R}^3
+$$
+
+其中 $(x_i,z_i,\theta_i) = h(T_{cw,i} \cdot T_{mc})$ 为第 $i$ 帧角色 2D 位姿。
+
+关键性质：该**世界系差分**与共享外参 $T_{mc}$ 无关（同一偏移在相减中抵消），因此它对 $T_{mc}$ 的雅可比为零，只约束相邻相机位姿的相对运动。
+
+残差（对 yaw 差分做角度归一化）：
+
+$$
+r_{odom}(T_{cw,i-1}, T_{cw,i}) = \delta_{map,i} - h(T_{cw,i} \cdot T_{mc}) + h(T_{cw,i-1} \cdot T_{mc}) \in \mathbb{R}^3
+$$
+
+在 EKF 中作为相对测量更新（固定上一帧参考位姿，数值雅可比当前帧 $T_{cw}$、$T_{mc}$）；在图优化中作为连接相邻位姿节点的 3 维因子。
+
 ### 3.3 优化问题
 
 $$
-\min_{T_{cw,0:N}, T_{mc}} \sum_{i=0}^{N-1} \| r_{vo,i} \|^2_{\Sigma_{vo}} + \sum_{i=0}^{N} \| r_{map,i} \|^2_{\Sigma_{map}} + \| r_{prior} \|^2_{\Sigma_{prior}}
+\min_{T_{cw,0:N}, T_{mc}} \sum_{i=0}^{N-1} \| r_{vo,i} \|^2_{\Sigma_{vo}} + \sum_{i=0}^{N} \| r_{map,i} \|^2_{\Sigma_{map}} + \sum_{i=1}^{N} \| r_{odom,i} \|^2_{\Sigma_{odom}} + \| r_{prior} \|^2_{\Sigma_{prior}}
 $$
 
 使用 **Levenberg-Marquardt** 或 **Gauss-Newton** 迭代求解。

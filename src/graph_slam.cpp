@@ -1,328 +1,217 @@
 #include "slam/graph_slam.h"
-#include "slam/se3.h"
-#include "slam/types.h"
-#include <cmath>
-#include <iostream>
+#include <Eigen/Cholesky>
 #include <algorithm>
+#include <cmath>
 
 namespace slam {
 
-GraphSLAM::GraphSLAM() : ext_node_id_(-1) {}
-
-int GraphSLAM::addNode(const cv::Mat& T_init) {
-    int id = (int)nodes_.size();
-    nodes_.push_back(T_init.clone());
-    return id;
+// Whiten by square root of information matrix (via Cholesky).
+static Matrix6 sqrt_info6(const Matrix6& info) {
+    Eigen::LLT<Matrix6> llt(info);
+    return llt.matrixL().transpose();  // J^T J = info
 }
 
-void GraphSLAM::addVOFactor(int i, int j, const cv::Mat& delta_T_ij, const cv::Mat& info) {
+static Matrix3 sqrt_info3(const Matrix3& info) {
+    Eigen::LLT<Matrix3> llt(info);
+    return llt.matrixL().transpose();
+}
+
+GraphSLAM::GraphSLAM() {}
+
+int GraphSLAM::addNode(const SE3& T_init) {
+    nodes_.push_back(T_init);
+    return (int)nodes_.size() - 1;
+}
+
+void GraphSLAM::addVOFactor(int i, int j, const SE3& delta_T_ij, const Matrix6& info) {
     Factor f;
-    f.type = FACTOR_VO;
+    f.type = FactorType::VO;
     f.node_ids = {i, j};
-    f.measurement = delta_T_ij.clone();
-    f.dim = 6;
-    // sqrt_info = chol(info) upper triangular
-    // sqrt_info = sqrt(Σ) * U^T where info = U * Σ * U^T (SVD square root)
-    cv::Mat U, W, Vt;
-    cv::SVD::compute(info, W, U, Vt, cv::SVD::MODIFY_A);
-    cv::Mat sqrt_W = cv::Mat::zeros(6, 6, CV_64F);
-    for (int k = 0; k < 6; ++k) sqrt_W.at<double>(k, k) = std::sqrt(W.at<double>(k, 0));
-    f.sqrt_info = sqrt_W * U.t();
+    f.delta_T = delta_T_ij;
+    f.info6 = info;
     factors_.push_back(f);
 }
 
-void GraphSLAM::addMapFactor(int pose_idx, int ext_idx, const cv::Mat& obs, const cv::Mat& info) {
+void GraphSLAM::addMapFactor(int pose_idx, int ext_idx, const MapObs& obs,
+                             const Matrix3& info) {
     Factor f;
-    f.type = FACTOR_MAP;
+    f.type = FactorType::MAP;
     f.node_ids = {pose_idx, ext_idx};
-    f.measurement = obs.clone();
-    f.dim = 3;
-    cv::Mat U, W, Vt;
-    cv::SVD::compute(info, W, U, Vt, cv::SVD::MODIFY_A);
-    cv::Mat sqrt_W = cv::Mat::zeros(3, 3, CV_64F);
-    for (int k = 0; k < 3; ++k) sqrt_W.at<double>(k, k) = std::sqrt(W.at<double>(k, 0));
-    f.sqrt_info = sqrt_W * U.t();
+    f.obs = obs;
+    f.info3 = info;
     factors_.push_back(f);
 }
 
-void GraphSLAM::addPriorFactor(int idx, const cv::Mat& T_prior, const cv::Mat& info) {
+void GraphSLAM::addMinimapOdomFactor(int i, int ext_idx, int j,
+                                     const MapObs& delta, const Matrix3& info) {
     Factor f;
-    f.type = FACTOR_PRIOR;
-    f.node_ids = {idx};
-    f.measurement = T_prior.clone();
-    f.dim = 6;
-    cv::Mat U, W, Vt;
-    cv::SVD::compute(info, W, U, Vt, cv::SVD::MODIFY_A);
-    cv::Mat sqrt_W = cv::Mat::zeros(6, 6, CV_64F);
-    for (int k = 0; k < 6; ++k) sqrt_W.at<double>(k, k) = std::sqrt(W.at<double>(k, 0));
-    f.sqrt_info = sqrt_W * U.t();
+    f.type = FactorType::MAP_ODOM;
+    f.node_ids = {i, ext_idx, j};
+    f.obs = delta;
+    f.info3 = info;
     factors_.push_back(f);
 }
 
-cv::Mat GraphSLAM::evaluateFactor(const Factor& f, const std::vector<cv::Mat>& nodes) const {
-    if (f.type == FACTOR_VO) {
-        // r = log(ΔT^{-1} * T_i^{-1} * T_j)^∨
-        cv::Mat T_i = nodes[f.node_ids[0]];
-        cv::Mat T_j = nodes[f.node_ids[1]];
-        cv::Mat delta_T = f.measurement;
-        cv::Mat Z = se3_compose(se3_inv(delta_T), se3_compose(se3_inv(T_i), T_j));
-        return se3_log(Z);
-    }
-    else if (f.type == FACTOR_MAP) {
-        // r = obs - h(T_cw * T_mc)
-        cv::Mat T_cw = nodes[f.node_ids[0]];
-        cv::Mat T_mc = nodes[f.node_ids[1]];
-        cv::Mat T_mw = se3_compose(T_cw, T_mc);
-        cv::Mat t = trans(T_mw);
-        cv::Mat R = rot(T_mw);
-        double f_x = R.at<double>(0, 2);
-        double f_z = R.at<double>(2, 2);
-        double theta = std::atan2(f_x, f_z);
-
-        cv::Mat pred(3, 1, CV_64F);
-        pred.at<double>(0) = t.at<double>(0);
-        pred.at<double>(1) = t.at<double>(2);
-        pred.at<double>(2) = theta;
-
-        cv::Mat r = f.measurement - pred;
-
-        // Normalize theta
-        while (r.at<double>(2) > M_PI)  r.at<double>(2) -= 2.0 * M_PI;
-        while (r.at<double>(2) < -M_PI) r.at<double>(2) += 2.0 * M_PI;
-
-        return r;
-    }
-    else if (f.type == FACTOR_PRIOR) {
-        // r = log(T_prior^{-1} * T)^∨
-        cv::Mat T = nodes[f.node_ids[0]];
-        cv::Mat T_prior = f.measurement;
-        cv::Mat Z = se3_compose(se3_inv(T_prior), T);
-        return se3_log(Z);
-    }
-    return cv::Mat();
+void GraphSLAM::addPriorFactor(int idx, const SE3& T_prior, const Matrix6& info) {
+    Factor f;
+    f.type = FactorType::PRIOR;
+    f.node_ids = {idx};
+    f.delta_T = T_prior;
+    f.info6 = info;
+    factors_.push_back(f);
 }
 
-cv::Mat GraphSLAM::numericalJacobian(const Factor& f, const std::vector<cv::Mat>& nodes,
-                                     int local_node_idx) const {
-    int global_idx = f.node_ids[local_node_idx];
-    int dim = f.dim;
-    double eps = 1e-6;
-
-    cv::Mat r0 = evaluateFactor(f, nodes);
-    cv::Mat J = cv::Mat::zeros(dim, 6, CV_64F);
-
-    for (int k = 0; k < 6; ++k) {
-        std::vector<cv::Mat> nodes_pert = nodes;
-        cv::Mat dxi = cv::Mat::zeros(6, 1, CV_64F);
-        dxi.at<double>(k) = eps;
-        nodes_pert[global_idx] = se3_compose(nodes_pert[global_idx], se3_exp(dxi));
-        cv::Mat r_pert = evaluateFactor(f, nodes_pert);
-        cv::Mat diff = (r_pert - r0) / eps;
-        diff.copyTo(J(cv::Rect(k, 0, 1, dim)));
+void GraphSLAM::evaluate(const Factor& f, Eigen::VectorXd& r) const {
+    if (f.type == FactorType::VO) {
+        const SE3 Ti = nodes_[f.node_ids[0]];
+        const SE3 Tj = nodes_[f.node_ids[1]];
+        const SE3 err = Ti.inverse() * Tj * f.delta_T.inverse();
+        r.resize(6);
+        r = err.log();
+    } else if (f.type == FactorType::MAP) {
+        const SE3 Tmw = nodes_[f.node_ids[0]] * nodes_[f.node_ids[1]];
+        const Eigen::Vector3d t = Tmw.translation();
+        const Eigen::Matrix3d R = Tmw.rotationMatrix();
+        const double fx = R(0, 2);
+        const double fz = R(2, 2);
+        const double theta = std::atan2(fx, fz);
+        r.resize(3);
+        r << t(0) - f.obs(0),
+             t(2) - f.obs(1),
+             theta - f.obs(2);
+        // wrap
+        while (r(2) > M_PI) r(2) -= 2.0 * M_PI;
+        while (r(2) < -M_PI) r(2) += 2.0 * M_PI;
+        r(0) = t(0) - f.obs(0);  // keep x,z as is
+        r(1) = t(2) - f.obs(1);
+    } else if (f.type == FactorType::MAP_ODOM) {
+        const SE3 Ti = nodes_[f.node_ids[0]];
+        const SE3 Tmc = nodes_[f.node_ids[1]];
+        const SE3 Tj = nodes_[f.node_ids[2]];
+        const SE3 mw_i = Ti * Tmc;
+        const SE3 mw_j = Tj * Tmc;
+        const Eigen::Vector3d ti = mw_i.translation();
+        const Eigen::Vector3d tj = mw_j.translation();
+        const Eigen::Matrix3d Ri = mw_i.rotationMatrix();
+        const Eigen::Matrix3d Rj = mw_j.rotationMatrix();
+        const double yi = std::atan2(Ri(0, 2), Ri(2, 2));
+        const double yj = std::atan2(Rj(0, 2), Rj(2, 2));
+        r.resize(3);
+        r << tj(0) - ti(0), tj(2) - ti(2), std::atan2(std::sin(yj - yi), std::cos(yj - yi));
+    } else {  // PRIOR
+        const SE3 err = f.delta_T.inverse() * nodes_[f.node_ids[0]];
+        r.resize(6);
+        r = err.log();
     }
-
-    return J;
 }
 
 double GraphSLAM::getChi2() const {
     double chi2 = 0.0;
     for (const auto& f : factors_) {
-        cv::Mat r = evaluateFactor(f, nodes_);
-        cv::Mat e = f.sqrt_info * r;
-        chi2 += e.dot(e);
+        Eigen::VectorXd r;
+        evaluate(f, r);
+        if (f.type == FactorType::VO || f.type == FactorType::PRIOR) {
+            chi2 += r.dot(f.info6 * r);
+        } else {
+            chi2 += r.dot(f.info3 * r);
+        }
     }
     return chi2;
 }
 
-void GraphSLAM::buildSystem(cv::Mat& H, cv::Mat& b) const {
-    int M = (int)nodes_.size();
-    H = cv::Mat::zeros(6 * M, 6 * M, CV_64F);
-    b = cv::Mat::zeros(6 * M, 1, CV_64F);
+void GraphSLAM::optimize(int max_iters, double /*lambda_init*/) {
+    if (nodes_.empty()) return;
+
+    // Ceres parameter blocks for each node: [qw,qx,qy,qz, x,y,z]
+    std::vector<std::array<double, 7>> params(nodes_.size());
+    std::vector<double*> param_ptrs(nodes_.size());
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        params[i] = se3ToParams(nodes_[i]);
+        param_ptrs[i] = params[i].data();
+    }
+
+    ceres::Problem problem;
+
+    // Manifold: quaternion (normalized) x Euclidean translation
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        auto* manifold =
+            new ceres::ProductManifold<ceres::QuaternionManifold,
+                                       ceres::EuclideanManifold<3>>(
+                ceres::QuaternionManifold(), ceres::EuclideanManifold<3>());
+        problem.AddParameterBlock(param_ptrs[i], 7, manifold);
+    }
 
     for (const auto& f : factors_) {
-        int n = (int)f.node_ids.size();
-        cv::Mat r = evaluateFactor(f, nodes_);
-
-        // Compute Jacobians for each connected node
-        std::vector<cv::Mat> Js(n);
-        for (int k = 0; k < n; ++k) {
-            Js[k] = numericalJacobian(f, nodes_, k);
-        }
-
-        // Compute whitened error: e = sqrt_info * r
-        cv::Mat e = f.sqrt_info * r;
-
-        // Accumulate Hessian
-        for (int k = 0; k < n; ++k) {
-            int id_k = f.node_ids[k];
-            cv::Mat Jk_w = f.sqrt_info * Js[k];  // whitened Jacobian
-
-            // Diagonal block: H[6*id_k:6*id_k+6, 6*id_k:6*id_k+6] += Jk^T * Jk
-            cv::Mat H_kk = Jk_w.t() * Jk_w;
-            H(cv::Rect(6 * id_k, 6 * id_k, 6, 6)) += H_kk;
-
-            // Right-hand side: b[6*id_k:6*id_k+6] += Jk^T * e
-            cv::Mat bk = Jk_w.t() * e;
-            b(cv::Rect(0, 6 * id_k, 1, 6)) += bk;
-
-            // Off-diagonal blocks
-            for (int l = k + 1; l < n; ++l) {
-                int id_l = f.node_ids[l];
-                cv::Mat Jl_w = f.sqrt_info * Js[l];
-                cv::Mat H_kl = Jk_w.t() * Jl_w;
-                H(cv::Rect(6 * id_l, 6 * id_k, 6, 6)) += H_kl;
-                H(cv::Rect(6 * id_k, 6 * id_l, 6, 6)) += H_kl.t();
-            }
+        if (f.type == FactorType::VO) {
+            VOFactorFunctor ff{f.delta_T, sqrt_info6(f.info6)};
+            auto* cost = new ceres::AutoDiffCostFunction<VOFactorFunctor, 6, 7, 7>(
+                new VOFactorFunctor(ff));
+            problem.AddResidualBlock(cost, nullptr,
+                                     param_ptrs[f.node_ids[0]],
+                                     param_ptrs[f.node_ids[1]]);
+        } else if (f.type == FactorType::MAP) {
+            MapFactorFunctor ff{f.obs, sqrt_info3(f.info3)};
+            auto* cost = new ceres::AutoDiffCostFunction<MapFactorFunctor, 3, 7, 7>(
+                new MapFactorFunctor(ff));
+            problem.AddResidualBlock(cost, nullptr,
+                                     param_ptrs[f.node_ids[0]],
+                                     param_ptrs[f.node_ids[1]]);
+        } else if (f.type == FactorType::MAP_ODOM) {
+            MinimapOdomFactorFunctor ff{f.obs, sqrt_info3(f.info3)};
+            auto* cost =
+                new ceres::AutoDiffCostFunction<MinimapOdomFactorFunctor, 3, 7, 7, 7>(
+                    new MinimapOdomFactorFunctor(ff));
+            problem.AddResidualBlock(cost, nullptr,
+                                     param_ptrs[f.node_ids[0]],
+                                     param_ptrs[f.node_ids[1]],
+                                     param_ptrs[f.node_ids[2]]);
+        } else {  // PRIOR
+            PriorFactorFunctor ff{f.delta_T, sqrt_info6(f.info6)};
+            auto* cost = new ceres::AutoDiffCostFunction<PriorFactorFunctor, 6, 7>(
+                new PriorFactorFunctor(ff));
+            problem.AddResidualBlock(cost, nullptr,
+                                     param_ptrs[f.node_ids[0]]);
         }
     }
-}
 
-void GraphSLAM::applyUpdate(const cv::Mat& dx) {
-    int M = (int)nodes_.size();
-    for (int i = 0; i < M; ++i) {
-        cv::Mat dxi = dx(cv::Rect(0, 6 * i, 1, 6));
-        nodes_[i] = se3_compose(nodes_[i], se3_exp(dxi));
+    ceres::Solver::Options options;
+    options.max_num_iterations = max_iters;
+    options.function_tolerance = 1e-10;
+    options.gradient_tolerance = 1e-10;
+    options.parameter_tolerance = 1e-12;
+    options.linear_solver_type = ceres::DENSE_QR;
+    options.minimizer_progress_to_stdout = false;
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    // Write back
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        nodes_[i] = paramsToSE3<double>(params[i].data());
     }
-}
-
-void GraphSLAM::optimize(int max_iters, double lambda_init) {
-    double chi2_best = getChi2();
-    std::vector<cv::Mat> best_nodes = nodes_;
-    double lambda = lambda_init;
-    int M = (int)nodes_.size();
-
-    for (int iter = 0; iter < max_iters; ++iter) {
-        cv::Mat H, b;
-        buildSystem(H, b);
-
-        bool step_accepted = false;
-        cv::Mat dx_best;
-
-        for (int trial = 0; trial < 20 && !step_accepted; ++trial) {
-            cv::Mat H_damped = H.clone();
-            for (int i = 0; i < 6 * M; ++i) {
-                double diag = std::abs(H.at<double>(i, i));
-                if (diag < 1e-12) diag = 1e-12;
-                H_damped.at<double>(i, i) += lambda * diag;
-            }
-
-            cv::Mat dx;
-            bool solved = cv::solve(H_damped, -b, dx, cv::DECOMP_CHOLESKY);
-            if (!solved) {
-                solved = cv::solve(H_damped, -b, dx, cv::DECOMP_SVD);
-                if (!solved) { lambda *= 3.0; continue; }
-            }
-
-            double norm_dx = cv::norm(dx);
-            if (norm_dx < 1e-8) return;
-
-            std::vector<cv::Mat> nodes_before = nodes_;
-            applyUpdate(dx);
-            double chi2_after = getChi2();
-
-            if (chi2_after < chi2_best) {
-                chi2_best = chi2_after;
-                best_nodes = nodes_;
-                lambda = std::max(lambda / 2.0, 1e-8);
-                step_accepted = true;
-                dx_best = dx;
-            } else {
-                nodes_ = nodes_before;
-                lambda = std::min(lambda * 2.0, 1e8);
-            }
-        }
-
-        if (!step_accepted) {
-            nodes_ = best_nodes;
-            break;
-        }
-
-        if (cv::norm(dx_best) < 1e-6) break;
-    }
-    nodes_ = best_nodes;
 }
 
 void GraphSLAM::marginalize(int idx) {
-    // Build the system, then marginalize out node idx using Schur complement
-    cv::Mat H, b;
-    buildSystem(H, b);
+    // Currently: drop the node and all factors referencing it.
+    // NOTE: does not inject the Schur-complement prior (see README findings).
+    if (idx < 0 || idx >= (int)nodes_.size()) return;
 
-    int M = (int)nodes_.size();
-    int block_size = 6;
+    factors_.erase(
+        std::remove_if(factors_.begin(), factors_.end(),
+                       [idx](const Factor& f) {
+                           return std::find(f.node_ids.begin(), f.node_ids.end(),
+                                            idx) != f.node_ids.end();
+                       }),
+        factors_.end());
 
-    // Partition: H = [H_mm, H_mr; H_rm, H_rr], b = [b_m; b_r]
-    // m = marginalized (idx), r = remaining
-    std::vector<int> rem_ids;
-    for (int i = 0; i < M; ++i) {
-        if (i != idx) rem_ids.push_back(i);
-    }
-    int n_rem = (int)rem_ids.size();
-
-    // Extract blocks
-    auto extractBlock = [&](int row_start, int col_start, int rows, int cols) -> cv::Mat {
-        return H(cv::Rect(col_start * block_size, row_start * block_size,
-                          cols * block_size, rows * block_size)).clone();
-    };
-
-    cv::Mat H_mm = extractBlock(idx, idx, 1, 1);
-    cv::Mat H_rr = cv::Mat::zeros(n_rem * block_size, n_rem * block_size, CV_64F);
-    cv::Mat H_mr = cv::Mat::zeros(block_size, n_rem * block_size, CV_64F);
-    cv::Mat H_rm = cv::Mat::zeros(n_rem * block_size, block_size, CV_64F);
-    cv::Mat b_m = b(cv::Rect(0, idx * block_size, 1, block_size)).clone();
-    cv::Mat b_r = cv::Mat::zeros(n_rem * block_size, 1, CV_64F);
-
-    for (int ri = 0; ri < n_rem; ++ri) {
-        int id = rem_ids[ri];
-        // H_mr
-        H.at<double>(idx * block_size, id * block_size); // just to check
-        cv::Mat sub = H(cv::Rect(id * block_size, idx * block_size,
-                                  block_size, block_size)).clone();
-        sub.copyTo(H_mr(cv::Rect(ri * block_size, 0, block_size, block_size)));
-        // H_rm
-        H.at<double>(id * block_size, idx * block_size);
-        sub = H(cv::Rect(idx * block_size, id * block_size,
-                          block_size, block_size)).clone();
-        sub.copyTo(H_rm(cv::Rect(0, ri * block_size, block_size, block_size)));
-        // H_rr
-        for (int rj = 0; rj < n_rem; ++rj) {
-            int jd = rem_ids[rj];
-            sub = H(cv::Rect(jd * block_size, id * block_size,
-                              block_size, block_size)).clone();
-            sub.copyTo(H_rr(cv::Rect(rj * block_size, ri * block_size,
-                                      block_size, block_size)));
-        }
-        // b_r
-        b_r(cv::Rect(0, ri * block_size, 1, block_size)) =
-            b(cv::Rect(0, id * block_size, 1, block_size)).clone();
-    }
-
-    // Schur complement: H_schur = H_rr - H_rm * H_mm^{-1} * H_mr
-    cv::Mat H_mm_inv = H_mm.inv(cv::DECOMP_SVD);
-    cv::Mat H_schur = H_rr - H_rm * H_mm_inv * H_mr;
-
-    // b_schur = b_r - H_rm * H_mm^{-1} * b_m
-    cv::Mat b_schur = b_r - H_rm * H_mm_inv * b_m;
-
-    // Remove the marginalized node
     nodes_.erase(nodes_.begin() + idx);
 
-    // Convert the Schur complement into a prior factor on the remaining nodes
-    // The prior has residual: r = J_rem * (nodes_rem - nodes_rem_linearization_point)
-    // But this is approximate. We'll add it as a custom prior.
-    // For simplicity, we store the linearization as a single prior factor on all remaining nodes.
-    // This is a simplification - in practice you'd want to re-linearize during optimization.
-
-    // Remove all factors that involve the marginalized node
-    factors_.erase(std::remove_if(factors_.begin(), factors_.end(),
-        [idx](const Factor& f) {
-            return std::find(f.node_ids.begin(), f.node_ids.end(), idx) != f.node_ids.end();
-        }), factors_.end());
-
-    // Create a prior factor from the Schur complement
-    // We create one factor per remaining node (this is approximate)
-    // The correct approach is to store the full linearized factor.
-    // For now, we just skip this in the interest of simplicity.
-    // The marginalization is mainly structural for the sliding window.
+    // Re-index surviving factor node ids (not performed by old code)
+    for (auto& f : factors_) {
+        for (auto& nid : f.node_ids) {
+            if (nid > idx) --nid;
+        }
+    }
 }
 
 } // namespace slam
