@@ -25,11 +25,13 @@
 
 ## 源代码结构
 - `src/calibration/` — 摄像头标定（C++ / Python），`test.py` 含硬编码 Linux 路径
+- `src/vo_frontend.cpp` + `include/slam/vo_frontend.h` — VO 前端（ORB 匹配 + 本质矩阵位姿估计）
 - `src/ekf_slam.cpp` + `include/slam/ekf_slam.h` — 误差状态 EKF（Sophus/Eigen）
 - `src/graph_slam.cpp` + `include/slam/graph_slam.h` — Ceres 因子图（VO/地图/帧间里程计/先验因子）
 - `include/slam/types.h` — 常用类型别名（SE3、Matrix6/12、MapObs、SE2）
 - `src/mock_test.cpp` — EKF mock 测试
 - `src/graph_test.cpp` — Ceres 图优化 mock 测试
+- `src/vo_test.cpp` — 视频驱动 VO → EKF 管线测试
 - `docs/derivation.md` — 公式推导（EKF + 图优化）
 
 ## 约定
@@ -50,7 +52,10 @@ mingw32-make -j4
 $env:Path = "D:\Path\glog\bin;$env:Path"
 .\build\mock_test.exe     # EKF
 .\build\graph_test.exe    # 图优化
-```
+
+# 运行 VO 视频测试（需 OpenCV DLL）
+$env:Path = "D:\Path\glog\bin;D:\Path\opencv\x64\mingw\bin;$env:Path"
+.\build\vo_test.exe [视频路径]
 
 ## 已知问题
 - 外参 `T_mc` 的 Y 平移在纯平面轨迹 + 小地图观测下不可观测；测试中靠先验约束（EKF 靠 Q 随机游走，图优化靠外参先验因子）

@@ -5,16 +5,16 @@
   - [x] Mock 测试（200 帧圆形轨迹）
   - [x] 公式推导文档（docs/derivation.md）
 
+- [x] VO 前端
+  - [x] 特征提取（ORB）
+  - [x] 帧间特征匹配（BFMatcher + Lowe ratio）
+  - [x] 本质矩阵 RANSAC + 位姿恢复
+  - [x] 视频驱动 VO → EKF 管线（vo_test.cpp）
+
 - [ ] 摄像头标定
   - [ ] 特征点检测 + subpix
   - [ ] 交互式标定 UI
   - [ ] 内参输出（K, dist_coeffs）
-
-- [ ] VO 前端
-  - [ ] 特征提取（ORB / FAST）
-  - [ ] 帧间特征匹配
-  - [ ] 对极几何 / PnP 位姿估计
-  - [ ] 输出 SE(3) 相对位姿
 
 - [ ] 小地图接入
   - [ ] 小地图 ROI 定位（画面截取）

@@ -73,3 +73,15 @@ add_executable(graph_test src/graph_test.cpp)
 target_link_libraries(graph_test slam_core)
 target_compile_definitions(graph_test PRIVATE
     SOPHUS_USE_BASIC_LOGGING=1 GLOG_USE_GLOG_EXPORT=1)
+
+# ============================================================
+# VO frontend + test (needs OpenCV for video I/O / features)
+# ============================================================
+set(OpenCV_DIR ${SLAM_DEPS_DIR}/opencv)
+find_package(OpenCV REQUIRED)
+
+add_executable(vo_test src/vo_test.cpp src/vo_frontend.cpp)
+target_include_directories(vo_test PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_compile_definitions(vo_test PRIVATE
+    SOPHUS_USE_BASIC_LOGGING=1 GLOG_USE_GLOG_EXPORT=1)
+target_link_libraries(vo_test slam_core ${OpenCV_LIBS})
