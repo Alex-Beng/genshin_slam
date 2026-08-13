@@ -85,3 +85,42 @@ target_include_directories(vo_test PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_compile_definitions(vo_test PRIVATE
     SOPHUS_USE_BASIC_LOGGING=1 GLOG_USE_GLOG_EXPORT=1)
 target_link_libraries(vo_test slam_core ${OpenCV_LIBS})
+
+# ============================================================
+# Minimap pipeline: capture + ROI extraction
+# ============================================================
+add_library(minimap_core STATIC
+    src/capture.cpp
+    src/minimap_pipeline.cpp
+    src/surf_loc.cpp
+    src/map_store.cpp
+    src/minimap_odom.cpp
+)
+target_include_directories(minimap_core PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_compile_definitions(minimap_core PUBLIC
+    SOPHUS_USE_BASIC_LOGGING=1 GLOG_USE_GLOG_EXPORT=1)
+target_link_libraries(minimap_core ${OpenCV_LIBS})
+
+add_executable(capture_test src/capture_test.cpp)
+target_include_directories(capture_test PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_compile_definitions(capture_test PRIVATE
+    SOPHUS_USE_BASIC_LOGGING=1 GLOG_USE_GLOG_EXPORT=1)
+target_link_libraries(capture_test minimap_core slam_core ${OpenCV_LIBS})
+
+add_executable(map_test src/map_test.cpp)
+target_link_libraries(map_test minimap_core slam_core ${OpenCV_LIBS})
+
+add_executable(slam_main src/slam_main.cpp)
+target_include_directories(slam_main PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_compile_definitions(slam_main PRIVATE
+    SOPHUS_USE_BASIC_LOGGING=1 GLOG_USE_GLOG_EXPORT=1)
+target_link_libraries(slam_main minimap_core slam_core ${OpenCV_LIBS})
+
+add_executable(surf_test src/surf_test.cpp)
+target_link_libraries(surf_test minimap_core slam_core ${OpenCV_LIBS})
+
+add_executable(cache_check src/cache_check.cpp)
+target_link_libraries(cache_check minimap_core slam_core ${OpenCV_LIBS})
